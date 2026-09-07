@@ -1,12 +1,13 @@
 """
-UNIFIED MASTER ABLATION & VISUALIZATION ENGINE (REAL DATA ONLY)
+UNIFIED MASTER ABLATION & VISUALIZATION ENGINE (PUBLICATION-GRADE REFACTOR)
 =============================================================================
 1. Executes 30-trial Monte Carlo ablation across PINN, WNLLS, and GP.
-2. Uses ONLY real measurement data (no synthetic augmentation).
-3. Robust statistics: Tracks outliers (>200% RPE) and reports medians.
-4. Three-way Wilcoxon signed-rank tests with explicit failure/exclusion tracking.
-5. Dynamic LHS collocation seeding for genuine Monte Carlo variance.
-6. Hardened execution with exception handling for classical estimators.
+2. Uses ONLY real measurement data with physical log-normal multiplicative noise.
+3. Softplus parameterization mu = softplus(z) + mu_floor (eliminates gradient vanishing/explosion).
+4. Robust pairwise-median initial slope estimation (Theil-Sen principle).
+5. Pre-step stationary checkpointing (data_loss + phys_loss) and Cosine Annealing scheduler.
+6. Distinct material-dependent PRNG seeding ensuring independent Monte Carlo trials.
+7. Three-way Wilcoxon signed-rank tests with explicit failure and outlier tracking.
 """
 
 import os
@@ -33,7 +34,7 @@ warnings.filterwarnings("ignore")
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-ALT_DATA_DIR = os.path.join(BASE_DIR, "PINN-for-gamma-rays", "data")
+ALT_DATA_DIR = os.path.join(os.path.dirname(BASE_DIR), "PINN-for-gamma-rays", "data")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
@@ -53,11 +54,14 @@ M_COLLOC = 500
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if device.type == "cpu" and torch_directml is not None:
-    device = torch_directml.device()
+    try:
+        device = torch_directml.device()
+    except Exception:
+        pass
 
 TORCH_DTYPE = torch.float32 
 
-print(f"Executing Master Ablation Suite (Real Data Only) on compute device: {device}")
+print(f"Executing Master Ablation Suite (Publication Grade) on compute device: {device}")
 print("=" * 75)
 
 
@@ -78,6 +82,36 @@ def resolve_material_file(mat_key):
 
     return None
 
+
+def robust_initial_slope(x_sub, y_noisy):
+    """
+    Robust initial estimate of the linear attenuation coefficient mu.
+    Uses pairwise median slopes (Theil-Sen estimator) in log-space.
+    Prevents single high-noise points from inverting the slope.
+    """
+    log_y = np.log(np.maximum(y_noisy, 1e-12))
+    n = len(x_sub)
+    slopes = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            dx = x_sub[j] - x_sub[i]
+            if abs(dx) > 1e-6:
+                slopes.append(-(log_y[j] - log_y[i]) / dx)
+    if slopes:
+        med_slope = float(np.median(slopes))
+        if 1e-4 <= med_slope <= 2.0:
+            return med_slope
+
+    try:
+        slope, _, _, _, _ = linregress(x_sub, log_y)
+        if -slope > 1e-4:
+            return float(-slope)
+    except Exception:
+        pass
+
+    return 0.05
+
+
 # ==========================================
 # STATISTICAL UTILITIES
 # ==========================================
@@ -91,6 +125,7 @@ def robust_stats(rpe_array, outlier_thresh=200.0):
         "outliers": n_outliers,
     }
 
+
 def paired_wilcoxon(a_rpe, b_rpe, label):
     valid = ~np.isnan(a_rpe) & ~np.isnan(b_rpe)
     n_excluded = int(np.sum(~valid))
@@ -103,8 +138,9 @@ def paired_wilcoxon(a_rpe, b_rpe, label):
         p = np.nan
     return p, n_excluded
 
+
 # ==========================================
-# 1. PINN ARCHITECTURE WITH LHS COLLOCATION
+# 1. UPGRADED PINN ARCHITECTURE
 # ==========================================
 class PINN(nn.Module):
     def __init__(self, initial_mu, hidden=32):
@@ -115,10 +151,22 @@ class PINN(nn.Module):
             nn.Linear(hidden, hidden), nn.Tanh(),
             nn.Linear(hidden, 1)
         )
-        self.log_mu = nn.Parameter(torch.tensor(np.log(initial_mu), dtype=TORCH_DTYPE))
+        # Softplus parameterization: mu = softplus(z) + mu_floor
+        # Bounded gradient d(mu)/dz in (0, 1) eliminates vanishing/exploding gradients
+        self.mu_floor = 1e-4
+        target_mu = max(float(initial_mu) - self.mu_floor, 1e-4)
+        if target_mu < 20.0:
+            z_init = np.log(np.exp(target_mu) - 1.0)
+        else:
+            z_init = target_mu
+        self.z_mu = nn.Parameter(torch.tensor(z_init, dtype=TORCH_DTYPE))
+
+    def get_mu(self):
+        return torch.nn.functional.softplus(self.z_mu) + self.mu_floor
 
     def forward(self, x):
         return self.net(x)
+
 
 def train_pinn_lhs(x_train, y_train, x_max, initial_mu, trial, epochs=PINN_EPOCHS, track_loss=False):
     x_mean, x_std = x_train.mean(), x_train.std()
@@ -128,7 +176,7 @@ def train_pinn_lhs(x_train, y_train, x_max, initial_mu, trial, epochs=PINN_EPOCH
     x_data_t = torch.tensor((x_train - x_mean) / x_std, dtype=TORCH_DTYPE).view(-1, 1).to(device)
     y_data_t = torch.tensor((y_log - y_mean) / y_std, dtype=TORCH_DTYPE).view(-1, 1).to(device)
 
-    # Dynamic seed for genuine Monte Carlo coverage
+    # Dynamic seed for genuine Monte Carlo collocation coverage
     sampler = qmc.LatinHypercube(d=1, seed=42 + trial)
     lhs_samples = sampler.random(n=M_COLLOC) * x_max
     x_colloc_t = torch.tensor((lhs_samples - x_mean) / x_std, dtype=TORCH_DTYPE).view(-1, 1).to(device)
@@ -137,24 +185,20 @@ def train_pinn_lhs(x_train, y_train, x_max, initial_mu, trial, epochs=PINN_EPOCH
     model = PINN(initial_mu=initial_mu).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     
-    # 1. ReduceLROnPlateau tracks loss stagnation dynamically
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=150, min_lr=1e-6)
+    # Cosine Annealing ensures reliable convergence without premature plateau freezing
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
     history = {'data': [], 'phys': [], 'total': []} if track_loss else None
 
-    # 2. Early stopping structures
     best_loss = float('inf')
     best_model_state = None
     
-    # 3. Adaptive Loss Weighting parameters
     lambda_phys = 1.0
-    alpha_ema = 0.9  # Exponential moving average momentum
+    alpha_ema = 0.9
 
     for epoch in range(epochs):
-        # --- ADAPTIVE WEIGHTING CALCULATION (Wang et al. method) ---
-        # Evaluate gradients every 10 epochs to reduce computational overhead
+        # Adaptive gradient balancing every 10 epochs (Wang et al. formulation)
         if epoch % 10 == 0:
-            # Data Loss gradients
             optimizer.zero_grad()
             y_pred_data_tmp = model(x_data_t)
             data_loss_tmp = torch.mean((y_pred_data_tmp - y_data_t) ** 2)
@@ -162,58 +206,54 @@ def train_pinn_lhs(x_train, y_train, x_max, initial_mu, trial, epochs=PINN_EPOCH
             grads_data = [p.grad.abs().max() for p in model.net.parameters() if p.grad is not None]
             max_grad_data = torch.max(torch.stack(grads_data)) if grads_data else torch.tensor(1.0).to(device)
             
-            # Physics Loss gradients
             optimizer.zero_grad()
             y_pred_colloc_tmp = model(x_colloc_t)
             dy_dx_tmp = torch.autograd.grad(y_pred_colloc_tmp, x_colloc_t, torch.ones_like(y_pred_colloc_tmp), create_graph=True)[0]
             mu_pred_tmp = -dy_dx_tmp * (y_std / x_std)
-            phys_loss_tmp = torch.mean((mu_pred_tmp - torch.exp(model.log_mu)) ** 2)
+            phys_loss_tmp = torch.mean((mu_pred_tmp - model.get_mu()) ** 2)
             phys_loss_tmp.backward(retain_graph=True)
             grads_phys = [p.grad.abs().mean() for p in model.net.parameters() if p.grad is not None]
             mean_grad_phys = torch.mean(torch.stack(grads_phys)) if grads_phys else torch.tensor(1.0).to(device)
             
-            # Apply EMA to smooth lambda scaling
             with torch.no_grad():
                 lambda_hat = max_grad_data / (mean_grad_phys + 1e-8)
                 lambda_phys = alpha_ema * lambda_phys + (1 - alpha_ema) * lambda_hat.item()
-                lambda_phys = min(max(lambda_phys, 0.01), 100.0)  # Bounds for stability
+                lambda_phys = min(max(lambda_phys, 0.05), 20.0)
 
         optimizer.zero_grad()
         
-        # Standard Forward Pass
         y_pred_data = model(x_data_t)
         data_loss = torch.mean((y_pred_data - y_data_t) ** 2)
         
         y_pred_colloc = model(x_colloc_t)
         dy_dx = torch.autograd.grad(y_pred_colloc, x_colloc_t, torch.ones_like(y_pred_colloc), create_graph=True)[0]
         mu_pred = -dy_dx * (y_std / x_std)
-        phys_loss = torch.mean((mu_pred - torch.exp(model.log_mu)) ** 2)
+        phys_loss = torch.mean((mu_pred - model.get_mu()) ** 2)
         
-        # Combined objective
+        # Stationary metric for checkpointing (unweighted sum) to avoid lambda-drift artifacts
+        eval_loss = data_loss.item() + phys_loss.item()
+        if eval_loss < best_loss:
+            best_loss = eval_loss
+            best_model_state = copy.deepcopy(model.state_dict())
+
         loss = data_loss + lambda_phys * phys_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
-        
-        # Step the plateau scheduler with the current loss magnitude
-        scheduler.step(loss)
-
-        # --- EARLY STOPPING TRIGGER ---
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            best_model_state = copy.deepcopy(model.state_dict())
+        scheduler.step()
 
         if track_loss and (epoch % 10 == 0):
             history['data'].append(data_loss.item())
             history['phys'].append(phys_loss.item())
             history['total'].append(loss.item())
 
-    # Restore minimum-loss weights to prevent utilizing overfit/degraded weights at epoch 3000
+    # Restore minimum stationary-loss weights
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    final_mu = torch.exp(model.log_mu).item()
+    final_mu = model.get_mu().item()
     return (final_mu, history) if track_loss else final_mu
+
 
 # ==========================================
 # 2. CLASSICAL ESTIMATORS (WNLLS & GP)
@@ -257,6 +297,7 @@ def fit_gp(x_train, y_train, x_max):
         return gp, mu_pred
     except Exception:
         return None, np.nan
+
 
 # ==========================================
 # 3. VISUALIZATION EXPORTERS
@@ -335,7 +376,6 @@ def generate_figure2_panel(summary_df):
             ('wnlls', '--s', 'tab:blue',  'WNLLS (Closed-Form Log-Linear)'),
             ('gp',    ':^',  'tab:green', 'GP Regressor')
         ]:
-            # Plotting medians so GP outliers don't destroy the visual scale
             medians = subset.groupby('noise_tier')[f'{algo}_rpe_median'].mean()
             ax.plot(NOISE_TIERS, medians, style, color=color, label=label, linewidth=1.8, markersize=6)
 
@@ -355,6 +395,7 @@ def generate_figure2_panel(summary_df):
     plt.savefig(fig_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"[SUCCESS] Figure 2 exported to: {fig_path}")
+
 
 # ==========================================
 # 4. MASTER EXECUTION ENGINE
@@ -391,21 +432,23 @@ def run_master_suite():
             for noise_idx, noise_std in enumerate(NOISE_TIERS):
                 pinn_mus, wnlls_mus, gp_mus = [], [], []
 
+                mat_hash = abs(hash(mat_key)) % 10000
                 for trial in range(N_TRIALS):
-                    np.random.seed(1000 * actual_N + 100 * noise_idx + trial)
-                    torch.manual_seed(1000 * actual_N + 100 * noise_idx + trial)
+                    # Material hash ensures unique independent PRNG sequence across materials with identical N
+                    np.random.seed(mat_hash + 1000 * actual_N + 100 * noise_idx + trial)
+                    torch.manual_seed(mat_hash + 1000 * actual_N + 100 * noise_idx + trial)
 
                     idx = np.linspace(0, len(x_raw) - 1, actual_N, dtype=int)
                     x_sub, y_sub = x_raw[idx], y_raw[idx]
 
                     if noise_std > 0:
-                        noise_arr = np.random.normal(0, noise_std, size=actual_N)
-                        y_noisy = np.clip(y_sub * (1 + noise_arr), a_min=1e-5, a_max=None)
+                        # Physical log-normal multiplicative noise: E[exp(eps - 0.5*sigma^2)] = 1
+                        eps = np.random.normal(0, noise_std, size=actual_N)
+                        y_noisy = y_sub * np.exp(eps - 0.5 * (noise_std ** 2))
                     else:
                         y_noisy = y_sub
 
-                    slope_guess, _, _, _, _ = linregress(x_sub, np.log(y_noisy))
-                    initial_mu_guess = max(-slope_guess, 1e-4)
+                    initial_mu_guess = robust_initial_slope(x_sub, y_noisy)
 
                     track_visuals = (trial == 0 and N_req == 'ALL' and noise_idx == len(NOISE_TIERS) - 1)
 
@@ -486,11 +529,12 @@ def run_master_suite():
         csv_path = os.path.join(RESULTS_DIR, "table1_master_robustness.csv")
         summary_df.to_csv(csv_path, index=False)
         print("\n" + "=" * 75)
-        print(f"[SUCCESS] Master robustness table (with median/outlier tracking) exported to: {csv_path}")
+        print(f"[SUCCESS] Master robustness table exported to: {csv_path}")
 
         generate_figure2_panel(summary_df)
         print("=" * 75)
         print("[ALL TASKS COMPLETED SUCCESSFULLY]")
+
 
 if __name__ == "__main__":
     run_master_suite()
