@@ -621,10 +621,686 @@ def run_buildup_experiment():
 
 
 # ============================================================
+# PUBLICATION OUTPUT ENGINE — ALL FIGURES AND TABLES
+# ============================================================
+# Called once after run_master_suite() has produced summary_df
+# and run_buildup_experiment() has produced buildup_df.
+# Produces:
+#   Figure 1  - Per-material loss curves (already per-material during training)
+#   Figure 2  - RPE vs noise panel (already in generate_figure2_panel)
+#   Figure 3  - Violin/box plots of RPE distributions at sigma=56.2%
+#   Figure 4  - FDR significance heatmap (q-values)
+#   Figure 5  - Bar chart: full-N median RPE all materials (clean summary)
+#   Figure 6  - Buildup experiment (already in run_buildup_experiment)
+#   Figure 7  - PINN vs WNLLS scatter: per-trial RPE at sigma=56.2% (diagnostic)
+#   Table 1   - LaTeX: Main robustness table with CI and FDR
+#   Table 2   - LaTeX: Ablation (noise tier vs method) condensed
+#   Table 3   - LaTeX: Computational complexity (manual, formatted)
+#   Table 4   - LaTeX: Buildup factor results
+#   stats.txt - Key numbers ready to copy into abstract/results text
+
+try:
+    import seaborn as sns
+    HAS_SEABORN = True
+except ImportError:
+    HAS_SEABORN = False
+
+from matplotlib.colors import LogNorm
+from matplotlib.patches import Patch
+import matplotlib.ticker as mticker
+
+# Colour palette consistent across all figures
+C_PINN  = "#e63946"   # vivid red
+C_WNLLS = "#457b9d"   # steel blue
+C_GP    = "#2a9d8f"   # teal
+C_LIGHT = "#f1faee"   # near-white background
+ALPHA   = 0.75
+
+# ============================================================
+# FIG 3: VIOLIN / BOX PLOTS AT sigma=56.2%
+# ============================================================
+def fig3_violin_plots(summary_df, raw_trial_data):
+    """
+    raw_trial_data: dict keyed by (material, N_label, noise_tier) ->
+        {'pinn': array(30,), 'wnlls': array(30,), 'gp': array(30,)}
+    Violin plots per material at the highest noise tier, full N.
+    """
+    high_noise_idx = len(NOISE_TIERS) - 1  # sigma=56.2%
+    materials_full = [m for m in MATERIALS]
+
+    fig, axes = plt.subplots(1, len(materials_full),
+                             figsize=(4 * len(materials_full), 6), sharey=False)
+    if len(materials_full) == 1:
+        axes = [axes]
+
+    for ax, mat_key in zip(axes, materials_full):
+        mat_name = MATERIALS[mat_key][0]
+        key = (mat_name, "ALL", high_noise_idx)
+        if key not in raw_trial_data:
+            ax.set_title(mat_name); continue
+
+        d = raw_trial_data[key]
+        pinn_r  = np.clip(np.nan_to_num(d["pinn"], nan=RPE_FAIL_PENALTY),  0, 300)
+        wnlls_r = np.clip(np.nan_to_num(d["wnlls"], nan=RPE_FAIL_PENALTY), 0, 300)
+        gp_r    = np.clip(np.nan_to_num(d["gp"], nan=RPE_FAIL_PENALTY),    0, 300)
+
+        positions = [1, 2, 3]
+        data_list = [pinn_r, wnlls_r, gp_r]
+        colors    = [C_PINN, C_WNLLS, C_GP]
+        labels    = ["PINN", "WNLLS", "GP"]
+
+        if HAS_SEABORN:
+            import pandas as _pd
+            df_long = _pd.DataFrame({
+                "RPE": np.concatenate([pinn_r, wnlls_r, gp_r]),
+                "Method": (["Rectified\nPINN"]*len(pinn_r) +
+                           ["WNLLS"]*len(wnlls_r) +
+                           ["GP"]*len(gp_r)),
+            })
+            sns.violinplot(data=df_long, x="Method", y="RPE", hue="Method",
+                           palette=[C_PINN, C_WNLLS, C_GP],
+                           inner="box", ax=ax, cut=0, linewidth=1.2, legend=False)
+        else:
+            vp = ax.violinplot(data_list, positions=positions, showmedians=True,
+                               showextrema=True)
+            for pc, col in zip(vp["bodies"], colors):
+                pc.set_facecolor(col); pc.set_alpha(0.65)
+            ax.set_xticks(positions); ax.set_xticklabels(labels, fontsize=9)
+
+        ax.set_title(f"{mat_name}\n(Full N, σ=56.2%)", fontsize=10, fontweight="bold")
+        ax.set_ylabel("RPE (%)" if mat_key == materials_full[0] else "")
+        ax.set_ylim(bottom=0)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.axhline(y=50, color="grey", ls=":", lw=1, alpha=0.6)
+
+    legend_els = [Patch(facecolor=C_PINN,  label="Rectified PINN"),
+                  Patch(facecolor=C_WNLLS, label="WNLLS"),
+                  Patch(facecolor=C_GP,    label="GP")]
+    fig.legend(handles=legend_els, loc="lower center", ncol=3,
+               fontsize=10, framealpha=0.9, bbox_to_anchor=(0.5, -0.02))
+    plt.suptitle("RPE Distribution at Extreme Noise (σ=56.2%) — Full Dataset",
+                 fontsize=13, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "fig3_violin_high_noise.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  [FIG 3] Violin plots -> {path}")
+
+
+# ============================================================
+# FIG 4: FDR SIGNIFICANCE HEATMAP
+# ============================================================
+def fig4_fdr_heatmap(summary_df):
+    """q-values for WNLLS<PINN comparison as a heatmap."""
+    noise_labels = [f"{s*100:.1f}%" for s in NOISE_TIERS]
+    n_labels     = ["N=5", "N=ALL"]
+
+    for pair_tag, title in [
+        ("wnlls_vs_pinn_penalty", "WNLLS < PINN (penalty-inclusive FDR q-value)"),
+        ("gp_vs_pinn_penalty",    "GP < PINN (penalty-inclusive FDR q-value)"),
+    ]:
+        q_col = f"qval_{pair_tag}"
+        if q_col not in summary_df.columns:
+            continue
+
+        fig, axes = plt.subplots(1, 2, figsize=(13, 4), sharey=True)
+        for ax, n_lbl in zip(axes, n_labels):
+            subset = summary_df[summary_df["N_label"] == n_lbl.replace("N=", "")]
+            mat_order = [MATERIALS[k][0] for k in MATERIALS]
+
+            matrix = np.ones((len(mat_order), len(NOISE_TIERS))) * np.nan
+            for i, mat_name in enumerate(mat_order):
+                for j, ns in enumerate(NOISE_TIERS):
+                    row = subset[
+                        (subset["material"] == mat_name) &
+                        (np.isclose(subset["noise_std"], ns, atol=1e-6))
+                    ]
+                    if len(row) > 0 and np.isfinite(row[q_col].values[0]):
+                        matrix[i, j] = row[q_col].values[0]
+
+            im = ax.imshow(matrix, vmin=0, vmax=1, aspect="auto",
+                           cmap="RdYlGn_r", origin="upper")
+            ax.set_xticks(range(len(NOISE_TIERS)))
+            ax.set_xticklabels(noise_labels, fontsize=8)
+            ax.set_yticks(range(len(mat_order)))
+            ax.set_yticklabels(mat_order, fontsize=9)
+            ax.set_title(f"{n_lbl}", fontsize=11, fontweight="bold")
+            ax.set_xlabel("Noise Tier σ", fontsize=9)
+
+            # Annotate cells
+            for i in range(len(mat_order)):
+                for j in range(len(NOISE_TIERS)):
+                    v = matrix[i, j]
+                    if np.isfinite(v):
+                        txt = f"{v:.3f}"
+                        star = "***" if v < 0.001 else ("**" if v < 0.01 else
+                               ("*" if v < 0.05 else ""))
+                        col = "white" if v < 0.3 else "black"
+                        ax.text(j, i, f"{txt}\n{star}", ha="center",
+                                va="center", fontsize=6.5, color=col,
+                                fontweight="bold" if star else "normal")
+
+            plt.colorbar(im, ax=ax, label="FDR q-value", fraction=0.046)
+
+        tag_short = pair_tag.split("_vs_")[0].upper()
+        plt.suptitle(f"Figure 4: {title}", fontsize=12, fontweight="bold", y=1.01)
+        plt.tight_layout()
+        fname = f"fig4_fdr_heatmap_{tag_short}_vs_PINN.png"
+        plt.savefig(os.path.join(RESULTS_DIR, fname), dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"  [FIG 4] FDR heatmap ({tag_short}) -> {fname}")
+
+
+# ============================================================
+# FIG 5: BAR CHART — FULL-N MEDIAN RPE ALL MATERIALS
+# ============================================================
+def fig5_material_bar_chart(summary_df):
+    """Clean summary bar chart: full-N, highest noise tier, all materials."""
+    subset = summary_df[
+        (summary_df["N_label"] == "ALL") &
+        (summary_df["noise_tier"] == len(NOISE_TIERS) - 1)
+    ].copy()
+
+    if subset.empty:
+        print("  [FIG 5] No data for ALL/high-noise — skipping.")
+        return
+
+    mat_names = subset["material"].tolist()
+    x         = np.arange(len(mat_names))
+    width     = 0.24
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+
+    bars_p = ax.bar(x - width, subset["pinn_rpe_median"].values,
+                    width, color=C_PINN,  alpha=ALPHA, label="Rectified PINN",
+                    edgecolor="black", linewidth=0.6)
+    bars_w = ax.bar(x,          subset["wnlls_rpe_median"].values,
+                    width, color=C_WNLLS, alpha=ALPHA, label="WNLLS",
+                    edgecolor="black", linewidth=0.6)
+    bars_g = ax.bar(x + width,  subset["gp_rpe_median"].values,
+                    width, color=C_GP,    alpha=ALPHA, label="GP",
+                    edgecolor="black", linewidth=0.6)
+
+    # Error bars using bootstrap CIs
+    for i, (bar, lo, hi) in enumerate(zip(
+            bars_p,
+            subset["pinn_rpe_ci_lo"].values,
+            subset["pinn_rpe_ci_hi"].values)):
+        med = subset["pinn_rpe_median"].values[i]
+        ax.errorbar(bar.get_x() + bar.get_width()/2, med,
+                    yerr=[[med-lo], [hi-med]], fmt="none",
+                    ecolor="black", capsize=4, linewidth=1.2)
+    for i, (bar, lo, hi) in enumerate(zip(
+            bars_w,
+            subset["wnlls_rpe_ci_lo"].values,
+            subset["wnlls_rpe_ci_hi"].values)):
+        med = subset["wnlls_rpe_median"].values[i]
+        ax.errorbar(bar.get_x() + bar.get_width()/2, med,
+                    yerr=[[med-lo], [hi-med]], fmt="none",
+                    ecolor="black", capsize=4, linewidth=1.2)
+    for i, (bar, lo, hi) in enumerate(zip(
+            bars_g,
+            subset["gp_rpe_ci_lo"].values,
+            subset["gp_rpe_ci_hi"].values)):
+        med = subset["gp_rpe_median"].values[i]
+        ax.errorbar(bar.get_x() + bar.get_width()/2, med,
+                    yerr=[[med-lo], [hi-med]], fmt="none",
+                    ecolor="black", capsize=4, linewidth=1.2)
+
+    # WNLLS failure annotations
+    for i, row in enumerate(subset.itertuples()):
+        if row.wnlls_failures > 0:
+            ax.text(i, row.wnlls_rpe_median + 2, f"✗{row.wnlls_failures}",
+                    ha="center", va="bottom", fontsize=8, color=C_WNLLS,
+                    fontweight="bold")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(mat_names, fontsize=10)
+    ax.set_ylabel("Median RPE (%) [95% bootstrap CI]", fontsize=10)
+    ax.set_xlabel("Attenuator Material", fontsize=10)
+    ax.set_title("Figure 5: Algorithm Comparison at Extreme Noise (σ=56.2%, Full Dataset)",
+                 fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10, framealpha=0.9)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "fig5_material_bar_chart.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  [FIG 5] Material bar chart -> {path}")
+
+
+# ============================================================
+# FIG 7: PER-TRIAL SCATTER — PINN vs WNLLS RPE AT sigma=56.2%
+# ============================================================
+def fig7_scatter_pinn_vs_wnlls(raw_trial_data):
+    """
+    Scatter plot: PINN RPE (x) vs WNLLS RPE (y) per trial.
+    Points above y=x diagonal → WNLLS worse; below → PINN worse.
+    One panel per material.
+    """
+    high_idx  = len(NOISE_TIERS) - 1
+    mat_keys  = [k for k in MATERIALS]
+    fig, axes = plt.subplots(1, len(mat_keys),
+                             figsize=(4*len(mat_keys), 4.5), sharey=False)
+    if len(mat_keys) == 1:
+        axes = [axes]
+
+    for ax, mat_key in zip(axes, mat_keys):
+        mat_name = MATERIALS[mat_key][0]
+        key = (mat_name, "ALL", high_idx)
+        if key not in raw_trial_data:
+            ax.set_title(mat_name); continue
+
+        d      = raw_trial_data[key]
+        p_rpe  = np.clip(d["pinn"],  0, 300)
+        w_rpe  = d["wnlls"]  # keep NaN for penalty
+
+        # Replace NaN with penalty
+        w_plot = np.where(np.isnan(w_rpe), RPE_FAIL_PENALTY, w_rpe)
+        w_plot = np.clip(w_plot, 0, 300)
+
+        # Color by outcome
+        pinn_better = p_rpe < w_plot
+        ax.scatter(p_rpe[ pinn_better], w_plot[ pinn_better], c=C_PINN,
+                   alpha=0.7, s=40, label="PINN better", zorder=3)
+        ax.scatter(p_rpe[~pinn_better], w_plot[~pinn_better], c=C_WNLLS,
+                   alpha=0.7, s=40, label="WNLLS better", zorder=3)
+
+        # Diagonal
+        lim = max(p_rpe.max(), w_plot.max()) * 1.05
+        ax.plot([0, lim], [0, lim], "k--", lw=1.2, alpha=0.5)
+
+        ax.set_xlabel("Rectified PINN RPE (%)", fontsize=9)
+        ax.set_ylabel("WNLLS RPE (%)" if mat_key == mat_keys[0] else "", fontsize=9)
+        ax.set_title(mat_name, fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(left=0); ax.set_ylim(bottom=0)
+
+        pinn_wins = int(pinn_better.sum())
+        ax.text(0.97, 0.04, f"PINN wins: {pinn_wins}/30",
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=8, color=C_PINN,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.8))
+
+    axes[0].legend(loc="upper left", fontsize=8, framealpha=0.9)
+    plt.suptitle("Figure 7: Per-Trial PINN vs WNLLS RPE Scatter (σ=56.2%, Full N)\n"
+                 "Points below diagonal → WNLLS better; above → PINN better",
+                 fontsize=11, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "fig7_scatter_pinn_vs_wnlls.png")
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  [FIG 7] Scatter diagnostic -> {path}")
+
+
+# ============================================================
+# FIG 8: NOISE-RAMP MULTI-MATERIAL OVERLAY
+# ============================================================
+def fig8_noise_ramp_overlay(summary_df):
+    """
+    One figure per N-label: all materials overlaid on same axes.
+    Shows how each material degrades with noise for the rectified PINN.
+    """
+    mat_colors = {m: MATERIALS[m][1] for m in MATERIALS}
+    noise_pct  = [s * 100 for s in NOISE_TIERS]
+
+    for n_lbl in ["5", "ALL"]:
+        subset = summary_df[summary_df["N_label"] == n_lbl]
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=False)
+
+        for algo, ax, col_med, col_lo, col_hi, title, color in [
+            ("pinn",  axes[0], "pinn_rpe_median",  "pinn_rpe_ci_lo",  "pinn_rpe_ci_hi",
+             "Rectified PINN",  C_PINN),
+            ("wnlls", axes[1], "wnlls_rpe_median", "wnlls_rpe_ci_lo", "wnlls_rpe_ci_hi",
+             "WNLLS",           C_WNLLS),
+            ("gp",    axes[2], "gp_rpe_median",    "gp_rpe_ci_lo",    "gp_rpe_ci_hi",
+             "GP",              C_GP),
+        ]:
+            for mat_key, (mat_name, mat_c) in MATERIALS.items():
+                mat_sub = subset[subset["material"] == mat_name].sort_values("noise_std")
+                if mat_sub.empty:
+                    continue
+                ns  = mat_sub["noise_std"].values * 100
+                med = mat_sub[col_med].values
+                lo  = mat_sub[col_lo].values
+                hi  = mat_sub[col_hi].values
+                ax.plot(ns, med, "-o", color=mat_c, label=mat_name,
+                        linewidth=1.8, markersize=5)
+                ax.fill_between(ns, lo, hi, color=mat_c, alpha=0.15)
+
+            ax.set_title(title, fontsize=11, fontweight="bold")
+            ax.set_xlabel("Noise Std σ (%)", fontsize=9)
+            ax.set_ylabel("Median RPE (%)" if algo == "pinn" else "", fontsize=9)
+            ax.grid(True, alpha=0.3)
+            ax.set_ylim(bottom=0)
+
+        axes[0].legend(fontsize=8, framealpha=0.9, ncol=1)
+        n_title = "N = 5 (Sparse)" if n_lbl == "5" else "N = Full Dataset"
+        plt.suptitle(f"Figure 8: RPE vs Noise — All Materials, {n_title}\n"
+                     "Shaded bands: 95% bootstrap CI on median",
+                     fontsize=12, fontweight="bold", y=1.02)
+        plt.tight_layout()
+        path = os.path.join(RESULTS_DIR, f"fig8_noise_ramp_N{n_lbl}.png")
+        plt.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"  [FIG 8] Noise ramp overlay (N={n_lbl}) -> {path}")
+
+
+# ============================================================
+# LATEX TABLE GENERATOR
+# ============================================================
+def generate_latex_tables(summary_df, buildup_df=None):
+    """
+    Writes three .tex files to RESULTS_DIR:
+      table1_main.tex     — main robustness comparison
+      table2_ablation.tex — condensed noise-tier ablation
+      table4_buildup.tex  — buildup factor results (if available)
+    """
+
+    # ---- Table 1: Main robustness ----
+    lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Monte Carlo Robustness Comparison (30 trials/cell). "
+        r"RPE values are median [95\% bootstrap CI]. "
+        r"Primary Wilcoxon test uses $\text{RPE}=1000\%$ penalty for NaN failures. "
+        r"FDR: Benjamini-Hochberg $q < 0.05$.}",
+        r"\label{tab:main_robustness}",
+        r"\scriptsize",
+        r"\begin{tabular}{llr|ccc|ccc|ccc|cr}",
+        r"\toprule",
+        r"Mat. & $N$ & $\sigma$ & \multicolumn{3}{c|}{Rectified PINN RPE (\%)} "
+        r"& \multicolumn{3}{c|}{WNLLS RPE (\%)} "
+        r"& \multicolumn{3}{c|}{GP RPE (\%)} "
+        r"& $q_{\text{WNLLS<PINN}}$ & WNLLS\\",
+        r" & & (\%) & Med [CI] & Mean & Outl. "
+        r"& Med [CI] & Mean & Outl. "
+        r"& Med [CI] & Mean & Outl. & & Fails\\",
+        r"\midrule",
+    ]
+
+    prev_mat = None
+    for _, row in summary_df.sort_values(
+            ["material", "N_actual", "noise_std"]).iterrows():
+        mat = row["material"]
+        N   = int(row["N_actual"])
+        sig = f"{row['noise_std']*100:.2f}"
+
+        def fmt(med, lo, hi, mean, outl):
+            ci_str = f"[{lo:.1f},{hi:.1f}]" if np.isfinite(lo) and np.isfinite(hi) else "[---]"
+            mean_s = f"{mean:.1f}" if np.isfinite(mean) else "---"
+            outl_s = str(int(outl)) if np.isfinite(outl) else "---"
+            return f"{med:.1f} {ci_str} & {mean_s} & {outl_s}"
+
+        p_s = fmt(row["pinn_rpe_median"],  row["pinn_rpe_ci_lo"],
+                  row["pinn_rpe_ci_hi"],   row["pinn_rpe_mean"],  row["pinn_outliers"])
+        w_s = fmt(row["wnlls_rpe_median"], row["wnlls_rpe_ci_lo"],
+                  row["wnlls_rpe_ci_hi"],  row["wnlls_rpe_mean"], row["wnlls_outliers"])
+        g_s = fmt(row["gp_rpe_median"],    row["gp_rpe_ci_lo"],
+                  row["gp_rpe_ci_hi"],     row["gp_rpe_mean"],    row["gp_outliers"])
+
+        q_col = "qval_wnlls_vs_pinn_penalty"
+        q_val = row.get(q_col, np.nan)
+        if np.isfinite(q_val):
+            stars = "***" if q_val < 0.001 else ("**" if q_val < 0.01 else
+                    ("*" if q_val < 0.05 else ""))
+            q_str = f"{q_val:.4f}{stars}"
+        else:
+            q_str = "---"
+
+        fails = int(row.get("wnlls_failures", 0))
+        mat_cell = r"\midrule " + mat if mat != prev_mat else ""
+        prev_mat = mat
+
+        line = (f"{mat_cell} & {N} & {sig} "
+                f"& {p_s} & {w_s} & {g_s} & {q_str} & {fails}\\\\")
+        lines.append(line)
+
+    lines += [
+        r"\bottomrule",
+        r"\multicolumn{14}{l}{\footnotesize{$*q<0.05$, $**q<0.01$, $***q<0.001$ "
+        r"(BH-FDR on penalty-inclusive Wilcoxon $p$-values). "
+        r"Outl.: trials with RPE $>200\%$. Fails: WNLLS NaN returns.}}",
+        r"\end{tabular}",
+        r"\end{table}",
+    ]
+
+    tex1_path = os.path.join(RESULTS_DIR, "table1_main.tex")
+    with open(tex1_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"  [LaTeX] Table 1 -> {tex1_path}")
+
+    # ---- Table 2: Condensed ablation (Full N, all noise tiers, all materials) ----
+    lines2 = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Ablation over Noise Tiers (Full Dataset $N$). "
+        r"Median RPE (\%) shown with 95\% bootstrap CI in brackets.}",
+        r"\label{tab:ablation_noise}",
+        r"\small",
+        r"\begin{tabular}{lr|ccc}",
+        r"\toprule",
+        r"Material & $\sigma$ (\%) & Rectified PINN & WNLLS & GP \\",
+        r"\midrule",
+    ]
+    full_n_df = summary_df[summary_df["N_label"] == "ALL"].sort_values(
+        ["material", "noise_std"])
+    prev2 = None
+    for _, row in full_n_df.iterrows():
+        mat = row["material"]
+        sig = f"{row['noise_std']*100:.1f}"
+        def short(med, lo, hi):
+            if np.isfinite(lo) and np.isfinite(hi):
+                return f"{med:.1f} [{lo:.1f}, {hi:.1f}]"
+            return f"{med:.1f}"
+        p_s = short(row["pinn_rpe_median"],  row["pinn_rpe_ci_lo"],  row["pinn_rpe_ci_hi"])
+        w_s = short(row["wnlls_rpe_median"], row["wnlls_rpe_ci_lo"], row["wnlls_rpe_ci_hi"])
+        g_s = short(row["gp_rpe_median"],    row["gp_rpe_ci_lo"],    row["gp_rpe_ci_hi"])
+        if mat != prev2:
+            lines2.append(r"\midrule")
+            prev2 = mat
+        lines2.append(f"{mat} & {sig} & {p_s} & {w_s} & {g_s} \\\\")
+    lines2 += [
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}",
+    ]
+    tex2_path = os.path.join(RESULTS_DIR, "table2_ablation.tex")
+    with open(tex2_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines2))
+    print(f"  [LaTeX] Table 2 -> {tex2_path}")
+
+    # ---- Table 3: Computational Complexity ----
+    lines3 = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{Computational Resource Consumption and Algorithmic Characteristics. "
+        r"Hardware: CPU-mode PyTorch / DirectML GPU (AMD Radeon, 8\,GB VRAM).}",
+        r"\label{tab:computational_complexity}",
+        r"\small",
+        r"\begin{tabular}{llcccc}",
+        r"\toprule",
+        r"Algorithm & Inversion Paradigm & Iterative? & Wall-Clock Time & GPU Req.? & Theoretical Failure Mode \\",
+        r"\midrule",
+        r"Naive PINN & Deep Neural ODE & Yes (3000) & $\sim$15.2\,s / trial & Optional & Vanishing gradient, runaway \\",
+        r"Rectified PINN & Constrained NN ODE & Yes (3000) & $\sim$14.8\,s / trial & Optional & Local sub-optimal minima \\",
+        r"WNLLS & Linearized GLS & No (Exact) & $<$0.0005\,s & No (CPU Only) & Matrix singularity ($A^T A$) \\",
+        r"GP Regressor & Bayesian Kernel & Yes (Opt) & $\sim$0.12\,s / trial & No (CPU Only) & Kernel length-scale collapse \\",
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\end{table}",
+    ]
+    tex3_path = os.path.join(RESULTS_DIR, "table3_complexity.tex")
+    with open(tex3_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines3))
+    print(f"  [LaTeX] Table 3 -> {tex3_path}")
+
+    # ---- Table 4: Buildup ----
+    if buildup_df is not None and len(buildup_df) > 0:
+        lines4 = [
+            r"\begin{table}[htbp]",
+            r"\centering",
+            r"\caption{Buildup Factor Proof-of-Concept: "
+            r"$I(x)=I_0(1+\beta x)e^{-\mu x}$, True $\mu=0.0500$~mm$^{-1}$, "
+            r"$\beta=0.0800$~mm$^{-1}$. WNLLS is misspecified (assumes pure exponential). "
+            r"$n=15$ trials per tier.}",
+            r"\label{tab:buildup}",
+            r"\small",
+            r"\begin{tabular}{r|rc|cc}",
+            r"\toprule",
+            r"$\sigma$ (\%) & WNLLS $\mu$ RPE (\%) & WNLLS Fails "
+            r"& PINN $\mu$ RPE (\%) & PINN $\beta$ RPE (\%) \\",
+            r"\midrule",
+        ]
+        for _, row in buildup_df.iterrows():
+            sig = f"{row['noise_std']*100:.2f}"
+            wr  = f"{row['wnlls_mu_rpe_median']:.1f}"
+            wf  = str(int(row["wnlls_failures"]))
+            pm  = f"{row['pinn_mu_rpe_median']:.1f}"
+            pb  = f"{row['pinn_beta_rpe_median']:.1f}"
+            lines4.append(f"{sig} & {wr} & {wf} & {pm} & {pb} \\\\")
+        lines4 += [
+            r"\bottomrule",
+            r"\end{tabular}",
+            r"\end{table}",
+        ]
+        tex4_path = os.path.join(RESULTS_DIR, "table4_buildup.tex")
+        with open(tex4_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines4))
+        print(f"  [LaTeX] Table 4 -> {tex4_path}")
+
+
+# ============================================================
+# SUMMARY STATISTICS TEXT FILE
+# ============================================================
+def generate_summary_stats(summary_df, buildup_df=None):
+    """
+    Writes a plain-text file with key numbers ready to copy into the
+    abstract and results section. Also prints them to console.
+    """
+    lines = ["=" * 70, "KEY STATISTICS FOR MANUSCRIPT (auto-generated)", "=" * 70]
+
+    # --- High-noise performance across all materials at full N ---
+    high = summary_df[
+        (summary_df["N_label"] == "ALL") &
+        (summary_df["noise_tier"] == len(NOISE_TIERS) - 1)
+    ]
+
+    lines.append("\n[HIGH-NOISE sigma=56.2%, FULL N]")
+    for _, row in high.iterrows():
+        mat  = row["material"]
+        pm   = row["pinn_rpe_median"]
+        wm   = row["wnlls_rpe_median"]
+        gm   = row["gp_rpe_median"]
+        wf   = int(row["wnlls_failures"])
+        po   = int(row["pinn_outliers"])
+        q    = row.get("qval_wnlls_vs_pinn_penalty", np.nan)
+        qdis = f"q={q:.4f}" if np.isfinite(q) else "q=nan"
+        lines.append(f"  {mat}: PINN={pm:.1f}% WNLLS={wm:.1f}%(fails={wf}) "
+                     f"GP={gm:.1f}% | PINN_outliers={po} | {qdis}")
+
+    # --- PINN improvement over naive (from Table 2 in manuscript) ---
+    lines.append("\n[PINN vs WNLLS: how many cells PINN wins at q<0.05]")
+    q_col = "qval_wnlls_vs_pinn_penalty"
+    if q_col in summary_df.columns:
+        n_sig_wvp = int(np.sum(summary_df[q_col] < 0.05))
+        lines.append(f"  WNLLS < PINN significant cells: {n_sig_wvp}/{len(summary_df)}")
+
+    q_col2 = "qval_gp_vs_pinn_penalty"
+    if q_col2 in summary_df.columns:
+        n_sig_gvp = int(np.sum(summary_df[q_col2] < 0.05))
+        lines.append(f"  GP < PINN significant cells:    {n_sig_gvp}/{len(summary_df)}")
+
+    # --- WNLLS failure counts ---
+    lines.append("\n[WNLLS FAILURE RATES]")
+    fail_df = summary_df[summary_df["wnlls_failures"] > 0]
+    if fail_df.empty:
+        lines.append("  No WNLLS failures across any cell.")
+    else:
+        for _, row in fail_df.iterrows():
+            lines.append(f"  {row['material']} N={row['N_actual']} "
+                         f"sigma={row['noise_std']*100:.1f}%: "
+                         f"{int(row['wnlls_failures'])}/30 failures")
+
+    # --- NIST discrepancies ---
+    lines.append("\n[NIST XCOM DISCREPANCIES (WOLS derived vs NIST)]")
+    nist_df = summary_df.drop_duplicates("material")[
+        ["material", "true_mu_wols", "nist_mu_mm", "mu_discrepancy_pct"]].dropna()
+    for _, row in nist_df.iterrows():
+        lines.append(f"  {row['material']}: derived={row['true_mu_wols']:.5f} mm^-1 "
+                     f"NIST={row['nist_mu_mm']:.5f} mm^-1 "
+                     f"disc={row['mu_discrepancy_pct']:+.1f}%")
+
+    # --- Buildup ---
+    if buildup_df is not None and len(buildup_df) > 0:
+        lines.append("\n[BUILDUP FACTOR EXPERIMENT SUMMARY]")
+        low_noise = buildup_df[buildup_df["noise_std"] < 0.05]
+        high_noise = buildup_df.iloc[-1]
+        if not low_noise.empty:
+            r = low_noise.iloc[0]
+            lines.append(f"  sigma=0%: WNLLS mu_RPE={r['wnlls_mu_rpe_median']:.1f}% "
+                         f"PINN mu_RPE={r['pinn_mu_rpe_median']:.1f}% "
+                         f"PINN beta_RPE={r['pinn_beta_rpe_median']:.1f}%")
+        lines.append(f"  sigma={high_noise['noise_std']*100:.1f}%: "
+                     f"WNLLS mu_RPE={high_noise['wnlls_mu_rpe_median']:.1f}% "
+                     f"PINN mu_RPE={high_noise['pinn_mu_rpe_median']:.1f}% "
+                     f"PINN beta_RPE={high_noise['pinn_beta_rpe_median']:.1f}%")
+
+    lines.append("\n" + "=" * 70)
+    text = "\n".join(lines)
+    print(text)
+
+    out = os.path.join(RESULTS_DIR, "summary_stats.txt")
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"  [STATS] Summary stats -> {out}")
+
+
+# ============================================================
+# MASTER PUBLICATION FIGURE CALLER
+# ============================================================
+def generate_publication_figures(summary_df, buildup_df=None, raw_trial_data=None):
+    """
+    Call after run_master_suite() to produce ALL publication outputs.
+    raw_trial_data: optional dict of per-trial RPE arrays for violin/scatter plots.
+    """
+    print("\n" + "=" * 75)
+    print("GENERATING PUBLICATION FIGURES AND TABLES")
+    print("=" * 75)
+
+    # Fig 2 is already called inside run_master_suite()
+
+    if raw_trial_data:
+        print("\n[Figures requiring per-trial data]")
+        fig3_violin_plots(summary_df, raw_trial_data)
+        fig7_scatter_pinn_vs_wnlls(raw_trial_data)
+    else:
+        print("\n[Violin/scatter skipped — raw_trial_data not passed]")
+
+    print("\n[Standard summary figures]")
+    fig4_fdr_heatmap(summary_df)
+    fig5_material_bar_chart(summary_df)
+    fig8_noise_ramp_overlay(summary_df)
+
+    print("\n[LaTeX tables]")
+    generate_latex_tables(summary_df, buildup_df)
+
+    print("\n[Summary statistics]")
+    generate_summary_stats(summary_df, buildup_df)
+
+    print("\n" + "=" * 75)
+    print("[ALL PUBLICATION OUTPUTS COMPLETE]")
+    print(f"Results directory: {RESULTS_DIR}")
+    print("=" * 75)
+
+# ============================================================
 # MASTER ABLATION ENGINE
 # ============================================================
 def run_master_suite():
     all_results = []
+    raw_trials_store = {}  # (mat_name, N_label, noise_tier) -> {'pinn':[], 'wnlls':[], 'gp':[]}
 
     for mat_key, (mat_name, _color) in MATERIALS.items():
         fpath = resolve_material_file(mat_key)
@@ -707,6 +1383,12 @@ def run_master_suite():
                 wnlls_rpe = np.abs((wnlls_arr - true_mu)/true_mu)*100.0
                 gp_rpe    = np.abs((gp_arr    - true_mu)/true_mu)*100.0
 
+                raw_trials_store[(mat_name, str(N_req), noise_idx)] = {
+                    'pinn':  pinn_rpe,
+                    'wnlls': wnlls_rpe,
+                    'gp':    gp_rpe,
+                }
+
                 pinn_s    = robust_stats(pinn_rpe)
                 wnlls_s   = robust_stats(wnlls_rpe)
                 gp_s      = robust_stats(gp_rpe)
@@ -775,7 +1457,10 @@ def run_master_suite():
     print(f"\n[SUCCESS] Master table -> {out}")
 
     generate_figure2_panel(summary_df)
-    run_buildup_experiment()
+    buildup_df = run_buildup_experiment()
+
+    # Generate all publication-quality figures and LaTeX tables
+    generate_publication_figures(summary_df, buildup_df, raw_trial_data=raw_trials_store)
 
     print("\n" + "="*75)
     print("[ALL TASKS COMPLETED SUCCESSFULLY]")
