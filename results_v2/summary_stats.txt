@@ -1,0 +1,32 @@
+======================================================================
+KEY STATISTICS FOR MANUSCRIPT (auto-generated)
+======================================================================
+
+[HIGH-NOISE sigma=56.2%, FULL N]
+  Aluminum: PINN=44.4% WNLLS=46.4%(fails=0) GP=47.6% | PINN_outliers=0 | q=1.0000
+  Copper: PINN=24.3% WNLLS=42.7%(fails=1) GP=32.9% | PINN_outliers=0 | q=1.0000
+  Brass: PINN=35.3% WNLLS=50.7%(fails=0) GP=26.9% | PINN_outliers=0 | q=1.0000
+  Steel: PINN=9.7% WNLLS=16.9%(fails=0) GP=8.0% | PINN_outliers=0 | q=1.0000
+  Lead: PINN=10.3% WNLLS=21.7%(fails=0) GP=12.7% | PINN_outliers=0 | q=1.0000
+
+[PINN vs WNLLS: how many cells PINN wins at q<0.05]
+  WNLLS < PINN significant cells: 12/50
+  GP < PINN significant cells:    10/50
+
+[WNLLS FAILURE RATES]
+  Aluminum N=5 sigma=56.2%: 4/30 failures
+  Copper N=5 sigma=56.2%: 4/30 failures
+  Copper N=6 sigma=56.2%: 1/30 failures
+
+[NIST XCOM DISCREPANCIES (WOLS derived vs NIST)]
+  Aluminum: derived=0.01686 mm^-1 NIST=0.02020 mm^-1 disc=-16.5%
+  Copper: derived=0.04794 mm^-1 NIST=0.05134 mm^-1 disc=-6.6%
+  Brass: derived=0.04602 mm^-1 NIST=0.04845 mm^-1 disc=-5.0%
+  Steel: derived=0.05063 mm^-1 NIST=0.04663 mm^-1 disc=+8.6%
+  Lead: derived=0.11643 mm^-1 NIST=0.12485 mm^-1 disc=-6.7%
+
+[BUILDUP FACTOR EXPERIMENT SUMMARY]
+  sigma=0%: WNLLS mu_RPE=58.7% PINN mu_RPE=38.3% PINN beta_RPE=251.9%
+  sigma=56.2%: WNLLS mu_RPE=63.2% PINN mu_RPE=31.6% PINN beta_RPE=242.6%
+
+======================================================================

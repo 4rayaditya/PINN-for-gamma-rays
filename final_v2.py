@@ -58,6 +58,8 @@ if device.type == "cpu" and torch_directml is not None:
         pass
 
 torch.use_deterministic_algorithms(True, warn_only=True)
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
 TORCH_DTYPE = torch.float32
 
 print(f"Executing Master Ablation Suite v2 (Publication Grade) on: {device}")
@@ -292,8 +294,9 @@ def train_pinn_lhs(x_train, y_train, x_max, initial_mu, trial,
 
     history     = {"data":[], "phys":[], "total":[]} if track_loss else None
     lam_history = [] if track_lambda else None
-    best_loss, best_state = float("inf"), None
-    lambda_phys = 1.0
+    best_loss   = float("inf")
+    best_state  = None
+    lambda_phys = torch.tensor(1.0, dtype=TORCH_DTYPE, device=device)
     alpha_ema   = 0.9
 
     for epoch in range(epochs):
@@ -316,10 +319,10 @@ def train_pinn_lhs(x_train, y_train, x_max, initial_mu, trial,
 
             with torch.no_grad():
                 lam_hat     = max_gd / (mean_gp + 1e-8)
-                lambda_phys = alpha_ema*lambda_phys + (1-alpha_ema)*lam_hat.item()
-                lambda_phys = float(np.clip(lambda_phys, 0.05, 20.0))
+                lambda_phys = alpha_ema * lambda_phys + (1.0 - alpha_ema) * lam_hat
+                lambda_phys = torch.clamp(lambda_phys, 0.05, 20.0)
             if track_lambda:
-                lam_history.append(lambda_phys)
+                lam_history.append(float(lambda_phys.item()))
 
         optimizer.zero_grad(set_to_none=True)
         data_loss = torch.mean((model(x_data_t) - y_data_t)**2)
@@ -328,10 +331,12 @@ def train_pinn_lhs(x_train, y_train, x_max, initial_mu, trial,
         mu_pred   = -dy2 * (y_std / x_std)
         phys_loss = torch.mean((mu_pred - model.get_mu())**2)
 
-        eval_loss = data_loss.item() + phys_loss.item()
-        if eval_loss < best_loss:
-            best_loss  = eval_loss
-            best_state = copy.deepcopy(model.state_dict())
+        # Periodic GPU evaluation & GPU-resident state snapshot (avoids host sync)
+        if epoch % 10 == 0:
+            eval_val = (data_loss + phys_loss).item()
+            if eval_val < best_loss:
+                best_loss  = eval_val
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
 
         loss = data_loss + lambda_phys * phys_loss
         loss.backward()
@@ -340,14 +345,14 @@ def train_pinn_lhs(x_train, y_train, x_max, initial_mu, trial,
         scheduler.step()
 
         if track_loss and epoch % 10 == 0:
-            history["data"].append(data_loss.item())
-            history["phys"].append(phys_loss.item())
-            history["total"].append(loss.item())
+            history["data"].append(float(data_loss.item()))
+            history["phys"].append(float(phys_loss.item()))
+            history["total"].append(float(loss.item()))
 
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    final_mu = model.get_mu().item()
+    final_mu = float(model.get_mu().item())
     if track_loss and track_lambda:
         return final_mu, history, lam_history
     if track_loss:
@@ -522,9 +527,10 @@ def train_pinn_buildup(x_train, y_train, x_max, init_mu, init_beta, trial, epoch
     model     = PINN_Buildup(init_mu=init_mu, init_beta=init_beta).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
-    best_loss, best_state = float("inf"), None
+    best_loss = float("inf")
+    best_state = None
 
-    for _ in range(epochs):
+    for epoch in range(epochs):
         optimizer.zero_grad(set_to_none=True)
         data_loss = torch.mean((model(x_data_t) - y_data_t)**2)
         yc        = model(x_colloc_t)
@@ -535,9 +541,13 @@ def train_pinn_buildup(x_train, y_train, x_max, init_mu, init_beta, trial, epoch
         ode_rhs   = beta_v / (1.0 + beta_v * x_phys_t) - mu_v
         phys_loss = torch.mean((dlnI_dx - ode_rhs)**2)
         total     = data_loss + phys_loss
-        if total.item() < best_loss:
-            best_loss  = total.item()
-            best_state = copy.deepcopy(model.state_dict())
+
+        if epoch % 10 == 0:
+            tot_val = total.item()
+            if tot_val < best_loss:
+                best_loss  = tot_val
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
         total.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()

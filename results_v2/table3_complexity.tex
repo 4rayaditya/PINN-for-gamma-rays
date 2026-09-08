@@ -1,0 +1,16 @@
+\begin{table}[htbp]
+\centering
+\caption{Computational Resource Consumption and Algorithmic Characteristics. Hardware: CPU-mode PyTorch / DirectML GPU (AMD Radeon, 8\,GB VRAM).}
+\label{tab:computational_complexity}
+\small
+\begin{tabular}{llcccc}
+\toprule
+Algorithm & Inversion Paradigm & Iterative? & Wall-Clock Time & GPU Req.? & Theoretical Failure Mode \\
+\midrule
+Naive PINN & Deep Neural ODE & Yes (3000) & $\sim$15.2\,s / trial & Optional & Vanishing gradient, runaway \\
+Rectified PINN & Constrained NN ODE & Yes (3000) & $\sim$14.8\,s / trial & Optional & Local sub-optimal minima \\
+WNLLS & Linearized GLS & No (Exact) & $<$0.0005\,s & No (CPU Only) & Matrix singularity ($A^T A$) \\
+GP Regressor & Bayesian Kernel & Yes (Opt) & $\sim$0.12\,s / trial & No (CPU Only) & Kernel length-scale collapse \\
+\bottomrule
+\end{tabular}
+\end{table}
