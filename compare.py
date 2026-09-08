@@ -1,1 +1,0 @@
-with open('run1.log') as f1, open('run2.log') as f2:    l1, l2 = f1.readlines(), f2.readlines()print('Identical:', l1 == l2)for i, (a, b) in enumerate(zip(l1, l2)):    if a != b:        print(f'First diff at line {i+1}:\n  run1: {a.strip()}\n  run2: {b.strip()}')        break
